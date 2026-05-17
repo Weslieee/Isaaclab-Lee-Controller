@@ -1,14 +1,15 @@
 """Test script for DroneController in an empty Isaac Lab scene.
 
-Runs a sequence of waypoints to validate position tracking and yaw control:
+Runs a sequence of waypoints to validate position tracking, yaw control,
+and physically realistic tilt-to-translate behavior:
 
     1. Hover in place at (0, 0, 1.5)
-    2. Move toward camera  (+0.8, -0.8,  0.0)
+    2. Move toward camera   (+0.8, -0.8,  0.0)
     3. Strafe left          ( 0.0, +0.8,  0.0)
     4. Ascend 0.5 m         ( 0.0,  0.0, +0.5)
-    5. Yaw -60 deg (CW)     ( 0.0,  0.0,  0.0, -60 deg)
+    5. Yaw -60 deg (CW)     ( 0.0,  0.0,  0.0,  -60 deg)
     6. Yaw +120 deg (CCW)   ( 0.0,  0.0,  0.0, +120 deg)
-    7. Return to origin     (-0.8,  0.0, -0.5, -60 deg)
+    7. Return to origin     (-0.8,  0.0, -0.5,  -60 deg)
 
 Usage (headless)::
 
@@ -16,13 +17,21 @@ Usage (headless)::
 
 Usage (with video recording)::
 
-    python test_drone_controller.py --headless --enable_cameras --device cuda:0 --video
+    python test_drone_controller.py --headless --enable_cameras \\
+        --device cuda:0 --video
+
+Custom drone asset::
+
+    python test_drone_controller.py --headless --device cuda:0 \\
+        --usd_path /path/to/cf2x.usd
 
 Requirements:
     - DroneController.py in the same directory
     - NVIDIA Isaac Lab with Isaac Sim 6.0.0
     - Crazyflie cf2x.usd asset at the path specified by --usd_path
 """
+
+from __future__ import annotations
 
 import argparse
 import math
@@ -34,7 +43,6 @@ from isaaclab.app import AppLauncher
 # ------------------------------------------------------------------ #
 #  CLI                                                                #
 # ------------------------------------------------------------------ #
-
 parser = argparse.ArgumentParser(description="DroneController waypoint test.")
 parser.add_argument(
     "--usd_path",
@@ -75,7 +83,7 @@ parser.add_argument(
     "--video_dir",
     type=str,
     default="./output",
-    help="Directory for saved video. Default: ./output",
+    help="Directory for the saved video. Default: ./output",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -87,29 +95,25 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # ------------------------------------------------------------------ #
-#  Imports (must come after AppLauncher)                              #
+#  Imports that require the simulation app to be running              #
 # ------------------------------------------------------------------ #
+import torch  # noqa: E402
 
-import torch
-from PIL import Image as PILImage
-
-import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg
-from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.sim import SimulationContext
+import isaaclab.sim as sim_utils  # noqa: E402
+from isaaclab.assets import Articulation, ArticulationCfg  # noqa: E402
+from isaaclab.actuators import ImplicitActuatorCfg  # noqa: E402
+from isaaclab.sim import SimulationContext  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from DroneController import DroneController
+from DroneController import DroneController  # noqa: E402
 
 # ------------------------------------------------------------------ #
 #  Constants                                                          #
 # ------------------------------------------------------------------ #
+SIM_DT = 0.005           # Physics timestep (s) - 200 Hz
+ROTOR_SPEED_K = 2200.0   # Visual spin scaling constant
 
-SIM_DT = 0.005   # Physics timestep (s) — 200 Hz
-ROTOR_SPEED_K = 2200.0  # Visual spin scaling constant
-
-# Waypoints: (description, dx, dy, dz, dyaw_deg)
-# All deltas are relative to the previous target in world frame.
+# (description, dx, dy, dz, dyaw_deg)
 # dyaw_deg: positive = counter-clockwise viewed from above.
 WAYPOINTS = [
     ("Hover in place",      0.0,  0.0,  0.0,    0.0),
@@ -122,34 +126,23 @@ WAYPOINTS = [
 ]
 
 
-# ------------------------------------------------------------------ #
-#  Helpers                                                            #
-# ------------------------------------------------------------------ #
-
 def log(msg: str) -> None:
+    """Tagged stdout logger."""
     print(f"[TEST] {msg}", flush=True)
-
-
-def wrap_angle(angle: float) -> float:
-    """Wrap angle to [-pi, pi]."""
-    while angle > math.pi:
-        angle -= 2 * math.pi
-    while angle < -math.pi:
-        angle += 2 * math.pi
-    return angle
 
 
 # ------------------------------------------------------------------ #
 #  Main                                                               #
 # ------------------------------------------------------------------ #
-
 def main() -> None:
     # -- Simulation setup ------------------------------------------ #
     sim_cfg = sim_utils.SimulationCfg(dt=SIM_DT, device=args_cli.device)
     sim = SimulationContext(sim_cfg)
     sim.set_camera_view(eye=[1.5, -1.5, 1.8], target=[0.0, 0.0, 1.5])
 
-    sim_utils.GroundPlaneCfg().func("/World/Ground", sim_utils.GroundPlaneCfg())
+    sim_utils.GroundPlaneCfg().func(
+        "/World/Ground", sim_utils.GroundPlaneCfg()
+    )
     sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)).func(
         "/World/Light", sim_utils.DomeLightCfg(intensity=3000.0)
     )
@@ -192,13 +185,15 @@ def main() -> None:
 
     # -- Video setup ----------------------------------------------- #
     rgb_annot = None
-    video_frames = []
+    video_frames: list = []
     video_interval = max(1, int(1.0 / (SIM_DT * 25)))  # target 25 fps
 
     if args_cli.video:
         import omni.replicator.core as rep
         os.makedirs(args_cli.video_dir, exist_ok=True)
-        rp = rep.create.render_product("/OmniverseKit_Persp", (1920, 1080))
+        rp = rep.create.render_product(
+            "/OmniverseKit_Persp", (1920, 1080)
+        )
         rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
         rgb_annot.attach([rp])
         log(f"Video recording enabled -> {args_cli.video_dir}/drone_flight.mp4")
@@ -207,7 +202,7 @@ def main() -> None:
     sim.reset()
     drone.update(SIM_DT)
 
-    # Rotor visual spin via USD Xform (bypasses physics)
+    # Rotor visual spin via USD Xform (bypasses physics; purely cosmetic)
     import omni.usd
     from pxr import UsdGeom
 
@@ -230,8 +225,31 @@ def main() -> None:
     log("Simulation ready.")
 
     # -- Controller init ------------------------------------------- #
-    controller = DroneController(device=args_cli.device)
+    controller = DroneController(device=args_cli.device, verbose=True)
     controller.reset(drone)
+
+    # -- Helpers --------------------------------------------------- #
+    def spin_rotors() -> None:
+        """Update visual rotor spin based on the last applied thrust."""
+        thrust = controller.last_thrust
+        if thrust is None:
+            return
+        avg_thrust = thrust[0].item() / 4.0
+        spin_rate = math.degrees(
+            ROTOR_SPEED_K * math.sqrt(max(avg_thrust, 0.0))
+        )
+        for i in range(4):
+            rotor_angles_deg[i] += rotor_dir[i] * spin_rate * SIM_DT
+            spin_ops[i].Set(float(rotor_angles_deg[i]))
+
+    def capture_frame(global_step: int) -> None:
+        """Append one frame to the video buffer when due."""
+        if rgb_annot is None or global_step % video_interval != 0:
+            return
+        sim.render()
+        rgb = rgb_annot.get_data()
+        if rgb is not None and rgb.size > 0:
+            video_frames.append(rgb[:, :, :3].copy())
 
     # -- Waypoint loop --------------------------------------------- #
     arrive_th = args_cli.arrive_threshold
@@ -253,59 +271,43 @@ def main() -> None:
 
         controller.set_target_delta(dx, dy, dz, dyaw)
         tgt = controller.target[0].tolist()
-        tgt_yaw = controller.target_yaw_deg
-        log(f"Target: pos=({tgt[0]:.2f}, {tgt[1]:.2f}, {tgt[2]:.2f}), yaw={tgt_yaw:.1f} deg")
+        log(
+            f"Target: pos=({tgt[0]:.2f}, {tgt[1]:.2f}, {tgt[2]:.2f}), "
+            f"yaw={controller.target_yaw_deg:.1f} deg"
+        )
 
         # -- Fly to waypoint --------------------------------------- #
         elapsed = 0.0
         arrived = False
         step_count = 0
+        dist = float("inf")
 
         while elapsed < timeout:
             dist = controller.step(drone)
             drone.write_data_to_sim()
             sim.step()
 
-            # Rotor visual spin
-            if controller.last_F_total is not None:
-                avg_thrust = controller.last_F_total[0].item() / 4.0
-                spin_rate = math.degrees(
-                    ROTOR_SPEED_K * math.sqrt(max(avg_thrust, 0.0))
-                )
-                for i in range(4):
-                    rotor_angles_deg[i] += rotor_dir[i] * spin_rate * SIM_DT
-                    spin_ops[i].Set(float(rotor_angles_deg[i]))
-
+            spin_rotors()
             drone.update(SIM_DT)
-
-            if rgb_annot is not None and global_step % video_interval == 0:
-                sim.render()
-                rgb = rgb_annot.get_data()
-                if rgb is not None and rgb.size > 0:
-                    video_frames.append(rgb[:, :, :3].copy())
+            capture_frame(global_step)
 
             elapsed += SIM_DT
             step_count += 1
             global_step += 1
 
+            yaw_err = abs(controller.yaw_error(drone)[0].item())
+
             if step_count % log_every == 0:
                 pos = drone.data.root_pos_w[0]
-                vel = drone.data.root_lin_vel_w[0]
                 quat = drone.data.root_quat_w[0]
                 from DroneController import _quat_to_yaw
                 cur_yaw = _quat_to_yaw(quat.unsqueeze(0))[0].item()
-                yaw_err = abs(wrap_angle(controller._target_yaw.item() - cur_yaw))
                 log(
                     f"  t={elapsed:.1f}s | "
                     f"pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) | "
                     f"yaw={math.degrees(cur_yaw):.1f} deg | "
                     f"dist={dist:.3f} m  yaw_err={math.degrees(yaw_err):.1f} deg"
                 )
-
-            quat = drone.data.root_quat_w[0]
-            from DroneController import _quat_to_yaw
-            cur_yaw = _quat_to_yaw(quat.unsqueeze(0))[0].item()
-            yaw_err = abs(wrap_angle(controller._target_yaw.item() - cur_yaw))
 
             if dist < arrive_th and yaw_err < arrive_yaw_th:
                 arrived = True
@@ -334,22 +336,9 @@ def main() -> None:
             drone.write_data_to_sim()
             sim.step()
 
-            if controller.last_F_total is not None:
-                avg_thrust = controller.last_F_total[0].item() / 4.0
-                spin_rate = math.degrees(
-                    ROTOR_SPEED_K * math.sqrt(max(avg_thrust, 0.0))
-                )
-                for i in range(4):
-                    rotor_angles_deg[i] += rotor_dir[i] * spin_rate * SIM_DT
-                    spin_ops[i].Set(float(rotor_angles_deg[i]))
-
+            spin_rotors()
             drone.update(SIM_DT)
-
-            if rgb_annot is not None and global_step % video_interval == 0:
-                sim.render()
-                rgb = rgb_annot.get_data()
-                if rgb is not None and rgb.size > 0:
-                    video_frames.append(rgb[:, :, :3].copy())
+            capture_frame(global_step)
 
             hover_elapsed += SIM_DT
             hover_step += 1
@@ -398,7 +387,7 @@ def main() -> None:
         )
 
     simulation_app.close()
-    sys.exit(0)
+    sys.exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":
