@@ -32,6 +32,8 @@ VLA model output: dx, dy, dz, dyaw
 └─────────────────────┘
 ```
 
+A real quadrotor can only push along its body +z axis. The controller converts the world-frame desired force into a scalar thrust `T = F_des · b3`, so horizontal motion arises naturally from the attitude loop tilting the body. This avoids the common pitfall of applying arbitrary world-frame forces.
+
 **Reference:**
 > T. Lee, M. Leok, and N. H. McClamroch, "Geometric Tracking Control of a Quadrotor UAV on SE(3)," *Proc. IEEE CDC*, 2010, pp. 5420–5425.
 
@@ -79,18 +81,48 @@ for step in range(num_steps):
 
 ### `DroneController(device, **gains)`
 
+**Physical parameters**
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `Kp_xy` | `2.0` | Position P gain, horizontal |
-| `Kd_xy` | `2.5` | Velocity D gain, horizontal |
-| `Kp_z` | `3.0` | Position P gain, vertical |
-| `Kd_z` | `3.0` | Velocity D gain, vertical |
+| `gravity` | `9.81` | Gravitational acceleration (m/s²) |
+| `arm_length` | `0.046` | Rotor arm length (m); reserved for future motor allocation |
+| `km_kf_ratio` | `0.006` | Torque-to-thrust coefficient ratio; reserved for future motor allocation |
+| `Ixx` | `1.4e-5` | Moment of inertia about body x-axis (kg·m²) |
+| `Iyy` | `1.4e-5` | Moment of inertia about body y-axis (kg·m²) |
+| `Izz` | `2.17e-5` | Moment of inertia about body z-axis (kg·m²) |
+
+**Position PD gains**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `Kp_xy` | `1.2` | Position P gain, horizontal |
+| `Kd_xy` | `1.8` | Velocity D gain, horizontal |
+| `Kp_z` | `2.0` | Position P gain, vertical |
+| `Kd_z` | `2.5` | Velocity D gain, vertical |
+
+**Attitude PD gains**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
 | `KR_xy` | `8e-4` | Attitude error gain, roll/pitch (N·m) |
 | `KR_z` | `4e-4` | Attitude error gain, yaw (N·m) |
 | `Kw_xy` | `2e-4` | Angular velocity gain, roll/pitch |
 | `Kw_z` | `1e-4` | Angular velocity gain, yaw |
-| `max_tilt_angle` | `0.5` rad | ~28°, limits horizontal aggressiveness |
+
+**Safety limits**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_tilt_angle` | `0.35` rad | ~20°, limits horizontal aggressiveness |
 | `max_thrust_ratio` | `3.0` | Max total thrust = 3 × hover thrust |
+| `min_thrust_ratio` | `0.1` | Minimum vertical force as a fraction of `mass * gravity`; prevents attitude flip on overshoot |
+
+**Logging**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `verbose` | `False` | Print target updates and reset banners to stdout |
 
 ### Methods
 
@@ -103,12 +135,28 @@ controller.set_target_delta(dx, dy, dz, dyaw=0.0)
 # Update target by world-frame delta. Targets are chained (cumulative).
 # dyaw in radians; positive = counter-clockwise viewed from above.
 
-controller.set_target_absolute(x, y, z)
+controller.set_target_absolute(x, y, z, yaw=None)
 # Set an absolute world-frame target position.
+# yaw (rad): if None, current target yaw is preserved.
 
 dist = controller.step(drone, dt=0.005)
-# Run one control step. Returns distance to target (m).
+# Run one control step. Returns mean distance to target (m).
 # Call before sim.step() every physics tick.
+
+err = controller.yaw_error(drone)
+# Returns shortest yaw error per environment, shape (N,), values in [-pi, pi].
+```
+
+### Properties
+
+```python
+controller.target          # Current target position, shape (1, 3), world frame
+controller.target_yaw      # Current target yaw, shape (1,), radians (wrapped)
+controller.target_yaw_deg  # Current target yaw in degrees (float)
+controller.drone_mass      # Drone mass in kg as read from PhysX at reset (float)
+controller.last_thrust     # Total thrust applied at the previous step, shape (N,) in Newtons
+                           # Returns None before the first step.
+controller.last_F_total    # Alias of last_thrust (backward compatibility)
 ```
 
 ---
@@ -126,6 +174,16 @@ python test_drone_controller.py --headless --enable_cameras --device cuda:0 --vi
 python test_drone_controller.py --headless --device cuda:0 \
     --usd_path /path/to/cf2x.usd
 ```
+
+Additional CLI options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--arrive_threshold` | `0.15` m | Position arrival threshold |
+| `--yaw_threshold` | `5.0` deg | Yaw arrival threshold |
+| `--hover_secs` | `2.0` s | Hover duration after each waypoint |
+| `--timeout_secs` | `10.0` s | Per-waypoint timeout |
+| `--video_dir` | `./output` | Directory for the saved video |
 
 The test runs 7 waypoints covering translation, ascent, yaw rotation, and return to origin. Passing criteria: position error < 0.15 m and yaw error < 5° at each waypoint.
 
